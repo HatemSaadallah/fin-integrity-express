@@ -34,6 +34,37 @@ const DISPUTE_STATUS: Record<string, string> = {
 };
 
 /**
+ * Stripe's payment statuses -> financial_event_status.
+ *
+ * Stripe has a different status vocabulary per object and it is wider than ours,
+ * so a raw pass-through sends values the server's enum rejects — and a rejected
+ * charge is a charge reconciliation never sees, which it then reports as a
+ * discrepancy that doesn't exist. Everything not yet settled folds onto
+ * `pending`: it is money that has not moved, which is exactly what the engine
+ * needs to know. Unmapped values are skipped rather than guessed at.
+ */
+const PAYMENT_STATUS: Record<string, string> = {
+  succeeded: "succeeded",
+  pending: "pending",
+  processing: "pending",
+  requires_payment_method: "pending",
+  requires_confirmation: "pending",
+  requires_action: "pending",
+  requires_capture: "pending",
+  failed: "failed",
+  canceled: "canceled",
+};
+
+/** Refunds carry their own smaller vocabulary. */
+const REFUND_STATUS: Record<string, string> = {
+  succeeded: "succeeded",
+  pending: "pending",
+  requires_action: "pending",
+  failed: "failed",
+  canceled: "canceled",
+};
+
+/**
  * Stripe's subscription statuses -> the five the SDK accepts. `unpaid` folds onto
  * `past_due` (both mean billing is failing and the charge hasn't landed).
  * `incomplete` / `incomplete_expired` are absent on purpose: those subscriptions
@@ -104,7 +135,8 @@ function captureStripeWebhook(fi: FinIntegrityClient, event: any): void {
     status = DISPUTE_STATUS[String(obj.status)];
     if (!status) return; // unmappable — skip rather than send a status ingest rejects
   } else if (obj.status) {
-    status = String(obj.status);
+    status = (type === "refund" ? REFUND_STATUS : PAYMENT_STATUS)[String(obj.status)];
+    if (!status) return; // same rule: never forward a status the enum will reject
   }
 
   // A dispute acts on a charge; link it so reconciliation can net it against the payment.
@@ -183,8 +215,13 @@ function captureInvoice(fi: FinIntegrityClient, event: any, obj: any): void {
     external_id: String(obj.id),
     amount: { minor: obj.amount_paid, currency: String(obj.currency ?? "") },
     subscriptionId: String(subscription),
-    ...(obj.status ? { status: String(obj.status) } : {}),
+    // "succeeded", never Stripe's own invoice status. An invoice says "paid",
+    // which is not a financial_event_status — the server rejects the event, the
+    // renewal charge never lands, and reconciliation reports the subscription as
+    // never charged: a false missing_subscription_charge every single cycle.
+    // We only get here from invoice.paid, so the money did move.
+    status: "succeeded",
     ...(typeof obj.created === "number" ? { occurred_at: new Date(obj.created * 1000) } : {}),
-    metadata: { stripe_event: event.id, stripe_object: "invoice" },
+    metadata: { stripe_event: event.id, stripe_object: "invoice", invoice_status: obj.status },
   });
 }

@@ -373,3 +373,68 @@ describe("flushOnResponse", () => {
     expect(t.sent).toHaveLength(1);
   });
 });
+
+describe("statuses the server's enum will actually accept", () => {
+  // financial_event_status, from supabase/migrations 0001_init + 0018_dispute_statuses.
+  // Anything outside this set is REJECTED at insert — and a rejected charge is one
+  // reconciliation never sees, so it invents a discrepancy that isn't real.
+  const VALID = new Set([
+    "pending", "succeeded", "failed", "refunded", "partially_refunded",
+    "canceled", "needs_response", "under_review", "won", "lost",
+  ]);
+
+  async function send(object: any): Promise<EventEnvelope[]> {
+    const t = new Capture();
+    const fi = new FinIntegrityClient({ transport: t, batch: { maxSize: 99 } });
+    const handler = stripeWebhookHandler(fi, {
+      stripe: stripeOk({ id: "evt_1", data: { object } }),
+      secret: "whsec_x",
+    });
+    handler(req as any, mkRes() as any);
+    await fi.flush();
+    return t.sent;
+  }
+
+  it("records a subscription renewal as succeeded, not Stripe's 'paid'", async () => {
+    const sent = await send({
+      object: "invoice", id: "in_1", status: "paid", amount_paid: 2999,
+      currency: "usd", subscription: "sub_1", charge: "ch_1",
+    });
+    // "paid" is not a financial_event_status: the renewal would be rejected at
+    // insert and every cycle would raise a false missing_subscription_charge.
+    expect(sent[0]!.status).toBe("succeeded");
+    expect(VALID.has(sent[0]!.status!)).toBe(true);
+    expect(sent[0]!.subscription_id).toBe("sub_1");
+  });
+
+  it.each([
+    ["payment_intent", "processing", "pending"],
+    ["payment_intent", "requires_payment_method", "pending"],
+    ["payment_intent", "requires_action", "pending"],
+    ["charge", "succeeded", "succeeded"],
+    ["charge", "failed", "failed"],
+  ])("maps %s status '%s' onto '%s'", async (object, stripeStatus, expected) => {
+    const sent = await send({ object, id: "x_1", status: stripeStatus, amount: 1000, currency: "usd" });
+    expect(sent[0]!.status).toBe(expected);
+    expect(VALID.has(sent[0]!.status!)).toBe(true);
+  });
+
+  it("skips a status it cannot map rather than having the event rejected", async () => {
+    const sent = await send({ object: "charge", id: "ch_9", status: "some_future_stripe_status", amount: 1000, currency: "usd" });
+    expect(sent).toHaveLength(0);
+  });
+
+  it("never emits a status outside the enum, for any object type", async () => {
+    const payloads = [
+      { object: "charge", id: "ch_1", status: "succeeded", amount: 100, currency: "usd" },
+      { object: "refund", id: "re_1", status: "pending", amount: 100, currency: "usd", charge: "ch_1" },
+      { object: "dispute", id: "dp_1", status: "warning_needs_response", amount: 100, currency: "usd", charge: "ch_1" },
+      { object: "invoice", id: "in_1", status: "paid", amount_paid: 100, currency: "usd", subscription: "sub_1" },
+    ];
+    for (const object of payloads) {
+      const sent = await send(object);
+      expect(sent).toHaveLength(1);
+      expect(VALID.has(sent[0]!.status!)).toBe(true);
+    }
+  });
+});
