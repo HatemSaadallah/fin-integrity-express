@@ -48,11 +48,18 @@ function mkRes() {
 }
 
 /** Drive one webhook through the handler and return what reached the transport. */
-async function deliver(event: any, opts: { onError?: (e: unknown) => void } = {}) {
+async function deliver(
+  event: any,
+  opts: { onError?: (e: unknown) => void; environment?: string | ((e: any) => string | undefined) } = {},
+) {
   const t = new Capture();
   const fi = new FinIntegrityClient({ transport: t, ...(opts.onError ? { onError: opts.onError } : {}) });
   const res = mkRes();
-  stripeWebhookHandler(fi, { stripe: stripeOk(event) as any, secret: "whsec_test" })(req, res);
+  stripeWebhookHandler(fi, {
+    stripe: stripeOk(event) as any,
+    secret: "whsec_test",
+    ...(opts.environment !== undefined ? { environment: opts.environment } : {}),
+  })(req, res);
   await fi.flush();
   return { sent: t.sent, res };
 }
@@ -436,5 +443,36 @@ describe("statuses the server's enum will actually accept", () => {
       expect(sent).toHaveLength(1);
       expect(VALID.has(sent[0]!.status!)).toBe(true);
     }
+  });
+});
+
+describe("environment tagging", () => {
+  const live = (over: any = {}) => ({ id: "evt_1", livemode: true, created: 1720000005, data: { object: charge(over) } });
+  const test_ = (over: any = {}) => ({ id: "evt_2", livemode: false, created: 1720000005, data: { object: charge(over) } });
+
+  it("defaults to production for live-mode webhooks", async () => {
+    const { sent } = await deliver(live());
+    expect(sent[0]!.environment).toBe("production");
+  });
+
+  it("defaults to test for test-mode webhooks", async () => {
+    const { sent } = await deliver(test_());
+    expect(sent[0]!.environment).toBe("test");
+  });
+
+  it("a string option pins every event to one environment", async () => {
+    const { sent } = await deliver(test_(), { environment: "staging" });
+    expect(sent[0]!.environment).toBe("staging");
+  });
+
+  it("a function option can map livemode to custom names", async () => {
+    const map = (e: any) => (e.livemode ? "prod" : "sandbox");
+    expect((await deliver(live(), { environment: map })).sent[0]!.environment).toBe("prod");
+    expect((await deliver(test_(), { environment: map })).sent[0]!.environment).toBe("sandbox");
+  });
+
+  it("tags subscription events too", async () => {
+    const { sent } = await deliver({ id: "evt_3", livemode: false, created: 1720000005, data: { object: subscription() } });
+    expect(sent[0]!.environment).toBe("test");
   });
 });

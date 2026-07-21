@@ -89,7 +89,18 @@ const INTERVALS = new Set(["day", "week", "month", "year"]);
  */
 export function stripeWebhookHandler(
   fi: FinIntegrityClient,
-  opts: { stripe: any; secret: string },
+  opts: {
+    stripe: any;
+    secret: string;
+    /**
+     * Environment to tag captured events with. A string pins one; a function
+     * receives the verified Stripe event and returns a name. Omit to use the
+     * default — Stripe's own `livemode`, so test webhooks land in `test` and
+     * live ones in `production`, never reconciling against each other. Pass your
+     * own names (e.g. `e => (e.livemode ? "prod" : "sandbox")`) to override.
+     */
+    environment?: string | ((event: any) => string | undefined);
+  },
 ) {
   return (req: ReqLike, res: ResLike): void => {
     let event: any;
@@ -100,12 +111,23 @@ export function stripeWebhookHandler(
       return;
     }
     try {
-      captureStripeWebhook(fi, event);
+      captureStripeWebhook(fi, event, resolveEnvironment(opts.environment, event));
     } catch {
       /* fail-open — never break the webhook ack */
     }
     res.json({ received: true });
   };
+}
+
+/** Live vs test Stripe traffic is genuinely different money, so keep it in
+ *  separate environments by default; a caller can override with their own names. */
+function resolveEnvironment(
+  env: string | ((event: any) => string | undefined) | undefined,
+  event: any,
+): string | undefined {
+  if (typeof env === "function") return env(event);
+  if (typeof env === "string") return env;
+  return event?.livemode === false ? "test" : "production";
 }
 
 /** Middleware that flushes queued events after each response finishes. */
@@ -116,13 +138,13 @@ export function flushOnResponse(fi: FinIntegrityClient) {
   };
 }
 
-function captureStripeWebhook(fi: FinIntegrityClient, event: any): void {
+function captureStripeWebhook(fi: FinIntegrityClient, event: any, environment?: string): void {
   const obj = event?.data?.object;
   if (!obj || typeof obj !== "object") return;
   const kind: string = obj.object;
 
-  if (kind === "subscription") return captureSubscription(fi, event, obj);
-  if (kind === "invoice") return captureInvoice(fi, event, obj);
+  if (kind === "subscription") return captureSubscription(fi, event, obj, environment);
+  if (kind === "invoice") return captureInvoice(fi, event, obj, environment);
 
   let type: EventType;
   if (kind === "refund") type = "refund";
@@ -160,6 +182,7 @@ function captureStripeWebhook(fi: FinIntegrityClient, event: any): void {
     amount: { minor: amount, currency: String(obj.currency ?? "") },
     ...(parent != null ? { parentExternalId: String(parent) } : {}),
     ...(status != null ? { status } : {}),
+    ...(environment != null ? { environment } : {}),
     ...(typeof obj.created === "number" ? { occurred_at: new Date(obj.created * 1000) } : {}),
     metadata: { stripe_event: event.id, stripe_object: kind },
   });
@@ -170,7 +193,7 @@ function captureStripeWebhook(fi: FinIntegrityClient, event: any): void {
  * arrive in. Not money movement; it's what lets reconciliation notice a billing
  * period that produced no charge at all.
  */
-function captureSubscription(fi: FinIntegrityClient, event: any, obj: any): void {
+function captureSubscription(fi: FinIntegrityClient, event: any, obj: any, environment?: string): void {
   const status = SUBSCRIPTION_STATUS[String(obj.status)];
   if (!status) return; // see SUBSCRIPTION_STATUS — unmapped statuses expect no charge
 
@@ -189,6 +212,7 @@ function captureSubscription(fi: FinIntegrityClient, event: any, obj: any): void
     ...(INTERVALS.has(interval) ? { interval } : {}),
     ...(typeof periodStart === "number" ? { currentPeriodStart: new Date(periodStart * 1000) } : {}),
     ...(typeof periodEnd === "number" ? { currentPeriodEnd: new Date(periodEnd * 1000) } : {}),
+    ...(environment != null ? { environment } : {}),
     // The subscription's own `created` is its birth, not this state change.
     ...(typeof event.created === "number" ? { occurred_at: new Date(event.created * 1000) } : {}),
     metadata: { stripe_event: event.id, stripe_object: "subscription" },
@@ -200,7 +224,7 @@ function captureSubscription(fi: FinIntegrityClient, event: any, obj: any): void
  * is what lets the engine pair the charge to its billing period; without it every
  * renewal looks unpaid.
  */
-function captureInvoice(fi: FinIntegrityClient, event: any, obj: any): void {
+function captureInvoice(fi: FinIntegrityClient, event: any, obj: any, environment?: string): void {
   // Stripe moved this under `parent` in 2025-04-30; read both.
   const subscription = obj.subscription ?? obj.parent?.subscription_details?.subscription;
   if (!subscription) return; // a one-off invoice isn't a subscription charge
@@ -221,6 +245,7 @@ function captureInvoice(fi: FinIntegrityClient, event: any, obj: any): void {
     // never charged: a false missing_subscription_charge every single cycle.
     // We only get here from invoice.paid, so the money did move.
     status: "succeeded",
+    ...(environment != null ? { environment } : {}),
     ...(typeof obj.created === "number" ? { occurred_at: new Date(obj.created * 1000) } : {}),
     metadata: { stripe_event: event.id, stripe_object: "invoice", invoice_status: obj.status },
   });
